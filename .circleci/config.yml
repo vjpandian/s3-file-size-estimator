@@ -1,13 +1,20 @@
 version: 2.1
 
 jobs:
-  simple-docker:
+  bucket-size-report:
     docker:
       - image: cimg/aws:2026.07
     steps:
       - checkout
+      - run:
+          name: Install boto3
+          command: pip3 install --user boto3
+      - run:
+          name: Report S3 bucket sizes
+          command: python3 scripts/bucket_size_report.py
 
 workflows:
   main:
     jobs:
-      - simple-docker
+      - bucket-size-report:
+          context: aws-context
