@@ -5,12 +5,24 @@ parameters:
     type: boolean
     default: false
 
+commands:
+  aws-oidc-auth:
+    description: Trade CircleCI's OIDC token for short-lived read-only AWS credentials.
+    steps:
+      - run:
+          name: Assume AWS role via OIDC
+          command: bash scripts/assume_aws_role.sh
+
 jobs:
   bucket-size-report:
     docker:
       - image: cimg/aws:2026.07
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ROLE_ARN: arn:aws:iam::047065097147:role/circleci-s3-dropbox-sync
     steps:
       - checkout
+      - aws-oidc-auth
       - run:
           name: Install boto3
           command: pip3 install --user boto3
@@ -41,8 +53,10 @@ jobs:
       # The AWS CLI errors with NoRegion unless a default is set; the
       # Dropbox secret and the bucket listing both resolve through this.
       AWS_DEFAULT_REGION: us-east-1
+      AWS_ROLE_ARN: arn:aws:iam::047065097147:role/circleci-s3-dropbox-sync
     steps:
       - checkout
+      - aws-oidc-auth
       - run:
           name: Install rclone
           command: sudo apt-get update && sudo apt-get install -y rclone
@@ -56,8 +70,7 @@ workflows:
     when:
       not: << pipeline.parameters.run-sync >>
     jobs:
-      - bucket-size-report:
-          context: aws-context
+      - bucket-size-report
       - configure-schedule:
           context: circleci-api
           # Serialized so two concurrent pipelines can't both see "no schedule"
@@ -68,7 +81,6 @@ workflows:
     when: << pipeline.parameters.run-sync >>
     jobs:
       - dropbox-sync:
-          context: aws-context
           # Only one sync touches Dropbox at a time. Hourly triggers against a
           # run that can last ~4h would otherwise overlap and fight over the
           # same destination paths.
