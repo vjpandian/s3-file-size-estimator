@@ -1,0 +1,13 @@
+version: 2.1
+
+jobs:
+  simple-docker:
+    docker:
+      - image: cimg/aws:2026.07
+    steps:
+      - checkout
+
+workflows:
+  main:
+    jobs:
+      - simple-docker
