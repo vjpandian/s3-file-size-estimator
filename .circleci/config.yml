@@ -21,6 +21,8 @@ jobs:
   configure-schedule:
     docker:
       - image: cimg/aws:2026.07
+    environment:
+      CIRCLE_PROJECT_SLUG: << pipeline.project.slug >>
     steps:
       - checkout
       - run:

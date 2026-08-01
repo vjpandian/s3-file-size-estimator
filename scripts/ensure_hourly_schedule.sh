@@ -10,15 +10,9 @@ set -euo pipefail
 
 SCHEDULE_NAME="hourly-dropbox-sync"
 
-# GitHub App projects are addressed by UUID (circleci/<org-id>/<project-id>);
-# only legacy GitHub OAuth projects use the github/<org>/<repo> form.
-if [[ -n "${PROJECT_SLUG:-}" ]]; then
-  :
-elif [[ -n "${CIRCLE_ORGANIZATION_ID:-}" && -n "${CIRCLE_PROJECT_ID:-}" ]]; then
-  PROJECT_SLUG="circleci/${CIRCLE_ORGANIZATION_ID}/${CIRCLE_PROJECT_ID}"
-else
-  PROJECT_SLUG="github/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
-fi
+# Injected from << pipeline.project.slug >> in config.yml, which resolves to
+# the right form for this project without guessing at OAuth vs GitHub App.
+PROJECT_SLUG="${CIRCLE_PROJECT_SLUG:?CIRCLE_PROJECT_SLUG is not set - it must be passed in from << pipeline.project.slug >>}"
 echo "Using project slug: ${PROJECT_SLUG}"
 
 if [[ -z "${CIRCLE_TOKEN:-}" ]]; then
