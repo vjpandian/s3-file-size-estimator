@@ -37,6 +37,10 @@ jobs:
   dropbox-sync:
     docker:
       - image: cimg/aws:2026.07
+    environment:
+      # The AWS CLI errors with NoRegion unless a default is set; the
+      # Dropbox secret and the bucket listing both resolve through this.
+      AWS_DEFAULT_REGION: us-east-1
     steps:
       - checkout
       - run:

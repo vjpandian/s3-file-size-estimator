@@ -71,6 +71,9 @@ def main() -> int:
             results.append((name, None, None, error_code))
             exit_code = 1
 
+    # Largest first; buckets that errored have no size, so they sort last.
+    results.sort(key=lambda r: (r[1] is None, -(r[1] or 0)))
+
     name_width = max(len(r[0]) for r in results)
 
     print(f"{'BUCKET':<{name_width}}  {'SIZE':>12}  {'OBJECTS':>10}")
