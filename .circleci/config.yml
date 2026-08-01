@@ -13,8 +13,32 @@ jobs:
           name: Report S3 bucket sizes
           command: python3 scripts/bucket_size_report.py
 
+  dropbox-sync:
+    docker:
+      - image: cimg/aws:2026.07
+    steps:
+      - checkout
+      - run:
+          name: Install rclone
+          command: sudo apt-get update && sudo apt-get install -y rclone
+      - run:
+          name: Sync S3 buckets to Dropbox
+          command: bash scripts/dropbox_sync.sh
+          no_output_timeout: 60m
+
 workflows:
   main:
     jobs:
       - bucket-size-report:
+          context: aws-context
+  nightly-dropbox-sync:
+    triggers:
+      - schedule:
+          cron: "0 7 * * *"
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - dropbox-sync:
           context: aws-context
