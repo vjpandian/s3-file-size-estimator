@@ -1,5 +1,10 @@
 version: 2.1
 
+parameters:
+  run-sync:
+    type: boolean
+    default: false
+
 jobs:
   bucket-size-report:
     docker:
@@ -13,6 +18,20 @@ jobs:
           name: Report S3 bucket sizes
           command: python3 scripts/bucket_size_report.py
 
+  configure-schedule:
+    docker:
+      - image: cimg/aws:2026.07
+    steps:
+      - checkout
+      - run:
+          name: Install CircleCI CLI
+          command: |
+            curl -1sLf 'https://packages.circleci.com/public/setup.deb.sh' | sudo -E bash
+            sudo apt-get install -y circleci
+      - run:
+          name: Ensure hourly sync schedule exists
+          command: bash scripts/ensure_hourly_schedule.sh
+
   dropbox-sync:
     docker:
       - image: cimg/aws:2026.07
@@ -24,21 +43,20 @@ jobs:
       - run:
           name: Sync S3 buckets to Dropbox
           command: bash scripts/dropbox_sync.sh
-          no_output_timeout: 60m
+          no_output_timeout: 3h
 
 workflows:
   main:
+    when:
+      not: << pipeline.parameters.run-sync >>
     jobs:
       - bucket-size-report:
           context: aws-context
-  nightly-dropbox-sync:
-    triggers:
-      - schedule:
-          cron: "0 7 * * *"
-          filters:
-            branches:
-              only:
-                - main
+      - configure-schedule:
+          context: circleci-api
+
+  scheduled-sync:
+    when: << pipeline.parameters.run-sync >>
     jobs:
       - dropbox-sync:
           context: aws-context
