@@ -54,9 +54,16 @@ workflows:
           context: aws-context
       - configure-schedule:
           context: circleci-api
+          # Serialized so two concurrent pipelines can't both see "no schedule"
+          # and race to create duplicate triggers.
+          serial-group: << pipeline.project.slug >>/configure-schedule
 
   scheduled-sync:
     when: << pipeline.parameters.run-sync >>
     jobs:
       - dropbox-sync:
           context: aws-context
+          # Only one sync touches Dropbox at a time. Hourly triggers against a
+          # run that can last ~4h would otherwise overlap and fight over the
+          # same destination paths.
+          serial-group: << pipeline.project.slug >>/dropbox-sync
