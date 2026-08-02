@@ -118,6 +118,11 @@ for bucket in "${buckets[@]}"; do
   if (( sync_status == 124 || sync_status == 137 )); then
     echo "Bucket ${bucket}: hit the time budget mid-sync; files already copied are intact, remainder resumes next run."
     deferred+=("$bucket")
+    # Everything still queued behind this bucket is outstanding too - record it
+    # so the summary reflects the real remaining work rather than just this one.
+    for remaining_bucket in "${buckets[@]}"; do
+      [[ " ${in_sync[*]} ${synced[*]} ${unverified[*]} ${failed[*]} ${deferred[*]} " == *" ${remaining_bucket} "* ]] || deferred+=("$remaining_bucket")
+    done
     break
   elif (( sync_status != 0 )); then
     echo "ERROR: ${bucket} sync exited with status ${sync_status}; will retry next run." >&2
