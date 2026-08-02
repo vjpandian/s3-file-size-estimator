@@ -49,6 +49,9 @@ jobs:
   dropbox-sync:
     docker:
       - image: cimg/aws:2026.07
+    # Network-bound work; the larger class buys bandwidth and enough CPU to
+    # keep more parallel transfers saturated.
+    resource_class: xlarge
     environment:
       # The AWS CLI errors with NoRegion unless a default is set; the
       # Dropbox secret and the bucket listing both resolve through this.

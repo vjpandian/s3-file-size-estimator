@@ -23,6 +23,11 @@ MAX_DELETE_PER_BUCKET=100
 # Transient network/API errors are retried in-run rather than left for the
 # next hour, so a single flaky file does not stall a bucket's progress.
 RCLONE_RETRIES=10
+# Parallelism. Overridable so the box size and these can be tuned together;
+# Dropbox rate-limits aggressively, and rclone backs off on 429 rather than
+# failing, so pushing this too high trades throughput for retry churn.
+TRANSFERS="${RCLONE_TRANSFERS:-16}"
+CHECKERS="${RCLONE_CHECKERS:-32}"
 
 START_TIME=$(date +%s)
 JOB_BUDGET_SECONDS=$((3 * 3600 + 45 * 60))  # 3h45m soft budget, inside CircleCI's 4h job cap
@@ -106,8 +111,8 @@ for bucket in "${buckets[@]}"; do
     rclone sync "s3:${bucket}" "$dest" \
       --s3-region "$region" \
       --s3-no-check-bucket \
-      --transfers 8 \
-      --checkers 8 \
+      --transfers "$TRANSFERS" \
+      --checkers "$CHECKERS" \
       --stats 30s \
       --max-delete "$MAX_DELETE_PER_BUCKET" \
       --retries "$RCLONE_RETRIES" \
