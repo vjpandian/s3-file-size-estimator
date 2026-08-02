@@ -49,10 +49,14 @@ jobs:
   dropbox-sync:
     docker:
       - image: cimg/aws:2026.07
-    # Network-bound work; the larger class buys bandwidth and enough CPU to
-    # keep more parallel transfers saturated.
-    resource_class: xlarge
+    # The bulk transfer is done; steady-state runs are listing and verification,
+    # which are light. Parallelism is scaled down to match - rclone buffers a
+    # ~48MB chunk per Dropbox upload, so high concurrency would risk OOM here
+    # if a large batch of new objects ever landed.
+    resource_class: small
     environment:
+      RCLONE_TRANSFERS: "4"
+      RCLONE_CHECKERS: "16"
       # The AWS CLI errors with NoRegion unless a default is set; the
       # Dropbox secret and the bucket listing both resolve through this.
       AWS_DEFAULT_REGION: us-east-1
