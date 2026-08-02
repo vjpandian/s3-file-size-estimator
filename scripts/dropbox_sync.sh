@@ -151,6 +151,10 @@ for bucket in "${buckets[@]}"; do
 
   sync_status=0
   sync_log="/tmp/sync_${bucket//\//_}.log"
+  # tee, not redirect: the log file is needed to learn refused paths, but the
+  # output must also stream live or a long bucket looks like a hung job.
+  # PIPESTATUS is required because $? would report tee's status, not rclone's.
+  set +e
   timeout --signal=TERM --kill-after=60s "${remaining}s" \
     rclone sync "s3:${bucket}" "$dest" \
       --s3-region "$region" \
@@ -158,6 +162,7 @@ for bucket in "${buckets[@]}"; do
       --transfers "$TRANSFERS" \
       --checkers "$CHECKERS" \
       --stats 30s \
+      --stats-one-line \
       --max-delete "$MAX_DELETE_PER_BUCKET" \
       "${EXCLUDES[@]}" \
       --exclude-from "$bucket_excl" \
@@ -165,8 +170,9 @@ for bucket in "${buckets[@]}"; do
       --retries "$RCLONE_RETRIES" \
       --low-level-retries 20 \
       --retries-sleep 10s \
-      -v > "$sync_log" 2>&1 || sync_status=$?
-  cat "$sync_log"
+      -v 2>&1 | tee "$sync_log"
+  sync_status=${PIPESTATUS[0]}
+  set -e
 
   # Learn any newly-refused paths so future runs stop attempting them. rclone
   # marks these "Can't retry this error"; without recording them the bucket
@@ -205,17 +211,22 @@ for bucket in "${buckets[@]}"; do
   differ_file="/tmp/differ_${bucket}.txt"
   : > "$missing_file"; : > "$differ_file"
 
+  echo "Bucket ${bucket}: verifying every object is present in Dropbox..."
+  set +e
   rclone check "s3:${bucket}" "$dest" \
     --one-way \
     --size-only \
     --s3-region "$region" \
     --dropbox-encoding "$DROPBOX_ENCODING" \
     --checkers "$CHECKERS" \
+    --stats 30s \
+    --stats-one-line \
     "${EXCLUDES[@]}" \
     --exclude-from "$bucket_excl" \
     --missing-on-dst "$missing_file" \
     --differ "$differ_file" \
-    >/dev/null 2>&1 || true
+    2>&1 | grep -vE '^[0-9/]+ [0-9:]+ (NOTICE|ERROR) : .*: (File not in|Sizes differ)' || true
+  set -e
 
   n_missing=$(wc -l < "$missing_file" | tr -d ' ')
   n_differ=$(wc -l < "$differ_file" | tr -d ' ')
