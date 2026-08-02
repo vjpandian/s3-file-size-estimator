@@ -91,12 +91,21 @@ rclone copyto "$UNSYNCABLE_REMOTE" "$UNSYNCABLE_LOCAL" --dropbox-encoding "$DROP
 [[ -f "$UNSYNCABLE_LOCAL" ]] || : > "$UNSYNCABLE_LOCAL"
 
 # bucket <tab> status <tab> objects <tab> missing <tab> differ <tab> timestamp
+#
+# Pushed to Dropbox after every bucket, not just at the end of the run. A run
+# that hits the time budget or is cancelled would otherwise lose every result
+# it had established, and the next run would redo that work from scratch.
 record_state() {
   local b="$1" status="$2" objects="$3" missing="$4" differ="$5"
   grep -v "^${b}	" "$STATE_LOCAL" > "${STATE_LOCAL}.tmp" 2>/dev/null || true
   mv "${STATE_LOCAL}.tmp" "$STATE_LOCAL"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$b" "$status" "$objects" "$missing" "$differ" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STATE_LOCAL"
+  rclone copyto "$STATE_LOCAL" "$STATE_REMOTE" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 \
+    || echo "WARNING: could not persist state for ${b}; it will be re-checked next run." >&2
+  if [[ -s "$UNSYNCABLE_LOCAL" ]]; then
+    rclone copyto "$UNSYNCABLE_LOCAL" "$UNSYNCABLE_REMOTE" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 || true
+  fi
 }
 
 mapfile -t buckets < <(aws s3api list-buckets --query 'Buckets[].Name' --output text | tr '\t' '\n' | sort)
