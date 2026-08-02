@@ -33,6 +33,12 @@ CHECKERS="${RCLONE_CHECKERS:-32}"
 # mirror would never converge. Encoding them to full-width equivalents makes
 # the upload succeed; the mapping is deterministic, so repeat runs still match.
 DROPBOX_ENCODING="Slash,BackSlash,Del,RightSpace,InvalidUtf8,Dot,Colon,Question,Asterisk,Pipe,LtGt,DoubleQuote"
+# Dropbox refuses these filenames outright - the API rejects them regardless of
+# encoding, so they can never be uploaded and would fail on every run forever.
+# They are macOS/Dropbox metadata with no backup value. Excluded from the sync
+# AND from verification, so the check does not report them missing in
+# perpetuity. Anything excluded here is intentionally not mirrored.
+EXCLUDES=(--exclude ".DS_Store" --exclude ".dropbox" --exclude ".dropbox.attr")
 
 START_TIME=$(date +%s)
 JOB_BUDGET_SECONDS=$((3 * 3600 + 45 * 60))  # 3h45m soft budget, inside CircleCI's 4h job cap
@@ -136,6 +142,7 @@ for bucket in "${buckets[@]}"; do
       --checkers "$CHECKERS" \
       --stats 30s \
       --max-delete "$MAX_DELETE_PER_BUCKET" \
+      "${EXCLUDES[@]}" \
       --dropbox-encoding "$DROPBOX_ENCODING" \
       --retries "$RCLONE_RETRIES" \
       --low-level-retries 20 \
@@ -174,13 +181,14 @@ for bucket in "${buckets[@]}"; do
     --s3-region "$region" \
     --dropbox-encoding "$DROPBOX_ENCODING" \
     --checkers "$CHECKERS" \
+    "${EXCLUDES[@]}" \
     --missing-on-dst "$missing_file" \
     --differ "$differ_file" \
     >/dev/null 2>&1 || true
 
   n_missing=$(wc -l < "$missing_file" | tr -d ' ')
   n_differ=$(wc -l < "$differ_file" | tr -d ' ')
-  n_source=$(rclone size "s3:${bucket}" --s3-region "$region" --json 2>/dev/null \
+  n_source=$(rclone size "s3:${bucket}" --s3-region "$region" "${EXCLUDES[@]}" --json 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])' 2>/dev/null || echo "?")
 
   if (( n_missing == 0 && n_differ == 0 )); then
