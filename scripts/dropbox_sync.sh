@@ -81,6 +81,15 @@ STATE_LOCAL="/tmp/verify_state.tsv"
 rclone copyto "$STATE_REMOTE" "$STATE_LOCAL" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 || : > "$STATE_LOCAL"
 [[ -f "$STATE_LOCAL" ]] || : > "$STATE_LOCAL"
 
+# Paths Dropbox has permanently refused. rclone says "Can't retry this error"
+# for these - retrying forever would keep the job red and stop the mirror ever
+# reaching a confirmed state. They are recorded here, excluded from subsequent
+# syncs and checks, and reported, so the run converges instead of thrashing.
+UNSYNCABLE_REMOTE="dropbox:/${DROPBOX_ROOT_PREFIX}/${VERIFY_DIR}/unsyncable.txt"
+UNSYNCABLE_LOCAL="/tmp/unsyncable.txt"
+rclone copyto "$UNSYNCABLE_REMOTE" "$UNSYNCABLE_LOCAL" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 || : > "$UNSYNCABLE_LOCAL"
+[[ -f "$UNSYNCABLE_LOCAL" ]] || : > "$UNSYNCABLE_LOCAL"
+
 # bucket <tab> status <tab> objects <tab> missing <tab> differ <tab> timestamp
 record_state() {
   local b="$1" status="$2" objects="$3" missing="$4" differ="$5"
@@ -133,7 +142,15 @@ for bucket in "${buckets[@]}"; do
   read -r db_n_before db_b_before < <(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["count"], d["bytes"])' 2>/dev/null || echo "0 0")
 
+  # The master list is stored as /<bucket>/<path> so entries stay attributable,
+  # but rclone matches --exclude-from patterns relative to the transfer root,
+  # which is the bucket itself. Project the relevant entries into that form.
+  bucket_excl="/tmp/excl_${bucket}.txt"
+  grep "^/${bucket}/" "$UNSYNCABLE_LOCAL" 2>/dev/null | sed "s#^/${bucket}/#/#" > "$bucket_excl" || : > "$bucket_excl"
+  [[ -f "$bucket_excl" ]] || : > "$bucket_excl"
+
   sync_status=0
+  sync_log="/tmp/sync_${bucket//\//_}.log"
   timeout --signal=TERM --kill-after=60s "${remaining}s" \
     rclone sync "s3:${bucket}" "$dest" \
       --s3-region "$region" \
@@ -143,11 +160,23 @@ for bucket in "${buckets[@]}"; do
       --stats 30s \
       --max-delete "$MAX_DELETE_PER_BUCKET" \
       "${EXCLUDES[@]}" \
+      --exclude-from "$bucket_excl" \
       --dropbox-encoding "$DROPBOX_ENCODING" \
       --retries "$RCLONE_RETRIES" \
       --low-level-retries 20 \
       --retries-sleep 10s \
-      -v || sync_status=$?
+      -v > "$sync_log" 2>&1 || sync_status=$?
+  cat "$sync_log"
+
+  # Learn any newly-refused paths so future runs stop attempting them. rclone
+  # marks these "Can't retry this error"; without recording them the bucket
+  # would fail identically every hour and never reach a verified state.
+  if grep -q "Can't retry this error" "$sync_log" 2>/dev/null; then
+    sed -n 's#^.*ERROR : \(.*\): Failed to copy: .*$#\1#p' "$sync_log" \
+      | sed "s#^#/${bucket}/#" >> "$UNSYNCABLE_LOCAL" || true
+    sort -u "$UNSYNCABLE_LOCAL" -o "$UNSYNCABLE_LOCAL"
+    echo "Bucket ${bucket}: recorded permanently-unuploadable paths; they are excluded from now on."
+  fi
 
   if (( sync_status == 124 || sync_status == 137 )); then
     echo "Bucket ${bucket}: hit the time budget mid-sync; files already copied are intact, remainder resumes next run."
@@ -159,9 +188,10 @@ for bucket in "${buckets[@]}"; do
     done
     break
   elif (( sync_status != 0 )); then
-    echo "ERROR: ${bucket} sync exited with status ${sync_status}; will retry next run." >&2
-    failed+=("$bucket")
-    continue
+    # Do not treat this as fatal yet. rclone returns non-zero for a single
+    # refused file even when every other object transferred. The per-file
+    # check below is the real arbiter of whether this bucket is complete.
+    echo "NOTE: ${bucket} sync exited ${sync_status}; verifying what actually landed." >&2
   fi
 
   echo "Bucket ${bucket}: sync step complete."
@@ -182,17 +212,23 @@ for bucket in "${buckets[@]}"; do
     --dropbox-encoding "$DROPBOX_ENCODING" \
     --checkers "$CHECKERS" \
     "${EXCLUDES[@]}" \
+    --exclude-from "$bucket_excl" \
     --missing-on-dst "$missing_file" \
     --differ "$differ_file" \
     >/dev/null 2>&1 || true
 
   n_missing=$(wc -l < "$missing_file" | tr -d ' ')
   n_differ=$(wc -l < "$differ_file" | tr -d ' ')
-  n_source=$(rclone size "s3:${bucket}" --s3-region "$region" "${EXCLUDES[@]}" --json 2>/dev/null \
+  n_skipped=$(grep -c "^/${bucket}/" "$UNSYNCABLE_LOCAL" 2>/dev/null || echo 0)
+  n_source=$(rclone size "s3:${bucket}" --s3-region "$region" "${EXCLUDES[@]}" --exclude-from "$bucket_excl" --json 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])' 2>/dev/null || echo "?")
 
   if (( n_missing == 0 && n_differ == 0 )); then
-    echo "Bucket ${bucket}: VERIFIED - all ${n_source} S3 objects present in Dropbox at matching size."
+    if (( n_skipped > 0 )); then
+      echo "Bucket ${bucket}: VERIFIED - all ${n_source} syncable S3 objects present in Dropbox at matching size (${n_skipped} unsyncable, see _verification/unsyncable.txt)."
+    else
+      echo "Bucket ${bucket}: VERIFIED - all ${n_source} S3 objects present in Dropbox at matching size."
+    fi
     record_state "$bucket" VERIFIED "$n_source" 0 0
     if [[ "${db_b_before}" == "$(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])' 2>/dev/null)" ]]; then
       echo "Bucket ${bucket}: nothing needed to be copied this run."
@@ -211,9 +247,14 @@ for bucket in "${buckets[@]}"; do
   fi
 done
 
-# Persist verification state for the next run before reporting.
+# Persist verification state and the learned unsyncable list for the next run.
 rclone copyto "$STATE_LOCAL" "$STATE_REMOTE" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 \
   || echo "WARNING: could not persist verification state to Dropbox." >&2
+if [[ -s "$UNSYNCABLE_LOCAL" ]]; then
+  rclone copyto "$UNSYNCABLE_LOCAL" "$UNSYNCABLE_REMOTE" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 \
+    || echo "WARNING: could not persist unsyncable list to Dropbox." >&2
+fi
+n_unsyncable=$(wc -l < "$UNSYNCABLE_LOCAL" 2>/dev/null | tr -d ' ' || echo 0)
 
 echo
 echo "============== THIS RUN =================="
@@ -240,9 +281,20 @@ for b in $(printf '%s\n' "${buckets[@]}" | sort); do
 done
 echo "=================================================="
 
+if (( n_unsyncable > 0 )); then
+  echo
+  echo "Permanently unsyncable (Dropbox refuses these names): ${n_unsyncable} file(s)."
+  echo "Full list: Dropbox /${DROPBOX_ROOT_PREFIX}/${VERIFY_DIR}/unsyncable.txt"
+fi
+
 if (( all_verified == 1 )); then
   echo
-  echo "CONFIRMED: every object in every S3 bucket exists in Dropbox at a matching size."
+  if (( n_unsyncable > 0 )); then
+    echo "CONFIRMED: every syncable object in every S3 bucket exists in Dropbox at a"
+    echo "matching size. The ${n_unsyncable} file(s) above are excluded by Dropbox itself."
+  else
+    echo "CONFIRMED: every object in every S3 bucket exists in Dropbox at a matching size."
+  fi
 else
   echo
   echo "NOT YET FULLY CONFIRMED - buckets above without VERIFIED status are still"
