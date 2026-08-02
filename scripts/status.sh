@@ -13,7 +13,12 @@ refresh_token=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["refresh
 ACCESS_TOKEN=$(curl -sf -X POST https://api.dropbox.com/oauth2/token \
   -d grant_type=refresh_token -d refresh_token="$refresh_token" -d client_id="$app_key" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-export ACCESS_TOKEN DROPBOX_ROOT_PREFIX
+
+# The authoritative bucket list comes from S3, never from the state file.
+# Reading only the state would silently omit buckets that have never been
+# checked and report a false all-clear.
+ALL_BUCKETS=$(aws s3api list-buckets --query 'Buckets[].Name' --output text | tr '\t' '\n' | sort)
+export ACCESS_TOKEN DROPBOX_ROOT_PREFIX ALL_BUCKETS
 
 python3 <<'PY'
 import json, os, urllib.request, urllib.error
@@ -49,20 +54,26 @@ for line in state_raw.splitlines():
     if len(parts) >= 6:
         state[parts[0]] = parts[1:]
 
-if not state:
-    print("No verification state yet - the sync has not completed a verified bucket.")
-    print("(State appears once a run on the verification-enabled code finishes a bucket.)")
+buckets = [b for b in os.environ["ALL_BUCKETS"].split("\n") if b.strip()]
+
+print(f"{'BUCKET':<50} {'STATUS':<14} {'OBJECTS':>9} {'MISSING':>8} {'LAST CHECKED':>21}")
+print("-" * 105)
+all_ok = True
+for b in buckets:
+    if b in state:
+        st, obj, mis, dif, ts = state[b][:5]
+    else:
+        st, obj, mis, ts = "NEVER-CHECKED", "-", "-", "-"
+    print(f"{b:<50} {st:<14} {obj:>9} {mis:>8} {ts:>21}")
+    if st != "VERIFIED":
+        all_ok = False
+print("-" * 105)
+print()
+if all_ok:
+    print(f"CONFIRMED: all {len(buckets)} buckets verified - every S3 object exists in Dropbox.")
 else:
-    print(f"{'BUCKET':<50} {'STATUS':<14} {'OBJECTS':>9} {'MISSING':>8} {'LAST CHECKED':>21}")
-    print("-" * 105)
-    all_ok = True
-    for b in sorted(state):
-        st, obj, mis, dif, ts = state[b][0], state[b][1], state[b][2], state[b][3], state[b][4]
-        print(f"{b:<50} {st:<14} {obj:>9} {mis:>8} {ts:>21}")
-        if st != "VERIFIED":
-            all_ok = False
-    print("-" * 105)
-    print()
-    print("CONFIRMED: every S3 object exists in Dropbox." if all_ok
-          else "NOT YET COMPLETE - buckets above without VERIFIED are still in progress.")
+    pending = [b for b in buckets if state.get(b, ["x"])[0] != "VERIFIED"]
+    print(f"NOT YET COMPLETE - {len(pending)} of {len(buckets)} buckets outstanding:")
+    for b in pending:
+        print(f"  - {b}")
 PY
