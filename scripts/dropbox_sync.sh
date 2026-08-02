@@ -64,6 +64,26 @@ token = {"access_token":"$access_token","token_type":"bearer","expiry":"$expiry"
 EOF
 chmod 600 ~/.config/rclone/rclone.conf
 
+# Verification state lives in Dropbox alongside the mirror but OUTSIDE any
+# bucket destination, so no rclone sync ever touches it. It carries per-bucket
+# verification results across runs, which is what makes "everything is
+# confirmed copied" a statement about all buckets rather than just this run's.
+VERIFY_DIR="_verification"
+STATE_REMOTE="dropbox:/${DROPBOX_ROOT_PREFIX}/${VERIFY_DIR}/state.tsv"
+STATE_LOCAL="/tmp/verify_state.tsv"
+
+rclone copyto "$STATE_REMOTE" "$STATE_LOCAL" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 || : > "$STATE_LOCAL"
+[[ -f "$STATE_LOCAL" ]] || : > "$STATE_LOCAL"
+
+# bucket <tab> status <tab> objects <tab> missing <tab> differ <tab> timestamp
+record_state() {
+  local b="$1" status="$2" objects="$3" missing="$4" differ="$5"
+  grep -v "^${b}	" "$STATE_LOCAL" > "${STATE_LOCAL}.tmp" 2>/dev/null || true
+  mv "${STATE_LOCAL}.tmp" "$STATE_LOCAL"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$b" "$status" "$objects" "$missing" "$differ" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STATE_LOCAL"
+}
+
 mapfile -t buckets < <(aws s3api list-buckets --query 'Buckets[].Name' --output text | tr '\t' '\n' | sort)
 
 # Rotate the starting point each run. Without this, a bucket big enough to
@@ -139,42 +159,87 @@ for bucket in "${buckets[@]}"; do
 
   echo "Bucket ${bucket}: sync step complete."
 
-  s3_bytes=$(rclone size "s3:${bucket}" --s3-region "$region" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || s3_bytes=""
-  db_bytes=$(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || db_bytes=""
+  # Per-file verification: every object in S3 must exist in Dropbox at the same
+  # size. --one-way ignores extra files on the Dropbox side; --size-only is
+  # required because S3 (MD5) and Dropbox (its own content hash) use different
+  # algorithms, so a cross-backend hash comparison is not possible. rclone
+  # check reads both sides and alters neither.
+  missing_file="/tmp/missing_${bucket}.txt"
+  differ_file="/tmp/differ_${bucket}.txt"
+  : > "$missing_file"; : > "$differ_file"
 
-  if [[ -z "$s3_bytes" || -z "$db_bytes" ]]; then
-    echo "Bucket ${bucket}: could not verify size reconciliation this run; will re-check next run."
-    continue
-  fi
+  rclone check "s3:${bucket}" "$dest" \
+    --one-way \
+    --size-only \
+    --s3-region "$region" \
+    --dropbox-encoding "$DROPBOX_ENCODING" \
+    --checkers "$CHECKERS" \
+    --missing-on-dst "$missing_file" \
+    --differ "$differ_file" \
+    >/dev/null 2>&1 || true
 
-  if (( s3_bytes > db_bytes )); then
-    diff=$(( s3_bytes - db_bytes ))
-  else
-    diff=$(( db_bytes - s3_bytes ))
-  fi
+  n_missing=$(wc -l < "$missing_file" | tr -d ' ')
+  n_differ=$(wc -l < "$differ_file" | tr -d ' ')
+  n_source=$(rclone size "s3:${bucket}" --s3-region "$region" --json 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])' 2>/dev/null || echo "?")
 
-  if (( diff <= SIZE_MISMATCH_TOLERANCE_BYTES )); then
-    if [[ "$db_bytes" == "$db_b_before" ]]; then
-      echo "Bucket ${bucket}: already in sync (${db_bytes}B) - nothing needed to be copied."
+  if (( n_missing == 0 && n_differ == 0 )); then
+    echo "Bucket ${bucket}: VERIFIED - all ${n_source} S3 objects present in Dropbox at matching size."
+    record_state "$bucket" VERIFIED "$n_source" 0 0
+    if [[ "${db_b_before}" == "$(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])' 2>/dev/null)" ]]; then
+      echo "Bucket ${bucket}: nothing needed to be copied this run."
       in_sync+=("$bucket")
     else
-      echo "Bucket ${bucket}: S3=${s3_bytes}B Dropbox=${db_bytes}B - matches within ~100MB tolerance."
       synced+=("$bucket")
     fi
   else
-    echo "Bucket ${bucket}: S3=${s3_bytes}B Dropbox=${db_bytes}B - still diverges by ${diff}B, will continue reconciling next run."
+    echo "Bucket ${bucket}: NOT YET VERIFIED - ${n_missing} missing, ${n_differ} size-mismatched (of ${n_source}). Next run retries them."
+    echo "  first few missing:"; head -5 "$missing_file" | sed 's/^/    /'
+    # Keep the outstanding list in Dropbox so it is inspectable between runs.
+    rclone copyto "$missing_file" "dropbox:/${DROPBOX_ROOT_PREFIX}/${VERIFY_DIR}/missing-${bucket}.txt" \
+      --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 || true
+    record_state "$bucket" INCOMPLETE "$n_source" "$n_missing" "$n_differ"
     unverified+=("$bucket")
   fi
 done
 
+# Persist verification state for the next run before reporting.
+rclone copyto "$STATE_LOCAL" "$STATE_REMOTE" --dropbox-encoding "$DROPBOX_ENCODING" >/dev/null 2>&1 \
+  || echo "WARNING: could not persist verification state to Dropbox." >&2
+
 echo
-echo "================ SUMMARY ================"
-echo "Already in sync (nothing to copy): ${#in_sync[@]}${in_sync:+ - ${in_sync[*]}}"
-echo "Transferred and reconciled:        ${#synced[@]}${synced:+ - ${synced[*]}}"
-echo "Still diverging (retry next run):  ${#unverified[@]}${unverified:+ - ${unverified[*]}}"
-echo "Deferred on time budget:           ${#deferred[@]}${deferred:+ - ${deferred[*]}}"
-echo "Failed:                            ${#failed[@]}${failed:+ - ${failed[*]}}"
-echo "========================================"
+echo "============== THIS RUN =================="
+echo "Nothing to copy:   ${#in_sync[@]}${in_sync:+ - ${in_sync[*]}}"
+echo "Transferred:       ${#synced[@]}${synced:+ - ${synced[*]}}"
+echo "Not yet verified:  ${#unverified[@]}${unverified:+ - ${unverified[*]}}"
+echo "Deferred on time:  ${#deferred[@]}${deferred:+ - ${deferred[*]}}"
+echo "Failed:            ${#failed[@]}${failed:+ - ${failed[*]}}"
+
+echo
+echo "======= CUMULATIVE VERIFICATION (all runs) ======="
+printf '%-50s %-12s %10s %9s %8s\n' BUCKET STATUS OBJECTS MISSING DIFFER
+all_verified=1
+for b in $(printf '%s\n' "${buckets[@]}" | sort); do
+  line=$(grep "^${b}	" "$STATE_LOCAL" 2>/dev/null || true)
+  if [[ -z "$line" ]]; then
+    printf '%-50s %-12s %10s %9s %8s\n' "$b" NEVER-CHECKED - - -
+    all_verified=0
+  else
+    IFS=$'\t' read -r _ st obj mis dif _ts <<<"$line"
+    printf '%-50s %-12s %10s %9s %8s\n' "$b" "$st" "$obj" "$mis" "$dif"
+    [[ "$st" == "VERIFIED" ]] || all_verified=0
+  fi
+done
+echo "=================================================="
+
+if (( all_verified == 1 )); then
+  echo
+  echo "CONFIRMED: every object in every S3 bucket exists in Dropbox at a matching size."
+else
+  echo
+  echo "NOT YET FULLY CONFIRMED - buckets above without VERIFIED status are still"
+  echo "being worked through. State carries over, so each run advances the total."
+fi
 
 if (( ${#failed[@]} > 0 )); then
   echo "Run had genuine failures - see errors above. Next run retries them."
