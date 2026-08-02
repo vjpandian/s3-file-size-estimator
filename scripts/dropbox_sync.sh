@@ -98,18 +98,14 @@ for bucket in "${buckets[@]}"; do
   dest="dropbox:/${DROPBOX_ROOT_PREFIX}/${bucket}"
   echo "=== s3://${bucket} (${region}) -> ${dest} [budget ${remaining}s] ==="
 
-  # Cheap up-front comparison: if object count and byte total already match,
-  # everything is present in Dropbox and there is nothing to transfer.
-  read -r s3_n s3_b < <(rclone size "s3:${bucket}" --s3-region "$region" --json 2>/dev/null \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["count"], d["bytes"])' 2>/dev/null || echo "")
-  read -r db_n db_b < <(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["count"], d["bytes"])' 2>/dev/null || echo "")
-
-  if [[ -n "$s3_n" && -n "$db_n" && "$s3_n" == "$db_n" && "$s3_b" == "$db_b" ]]; then
-    echo "Bucket ${bucket}: already in sync (${s3_n} objects, ${s3_b} bytes) - nothing to copy."
-    in_sync+=("$bucket")
-    continue
-  fi
+  # Snapshot the destination first so we can tell afterwards whether this run
+  # actually had to move anything. Deliberately NOT used to skip the sync: a
+  # file edited in place at the same byte size would leave count and total
+  # unchanged, and skipping on that basis would strand the stale copy in
+  # Dropbox forever. rclone's own modtime+size comparison catches that, so it
+  # always runs and decides for itself what needs transferring.
+  read -r db_n_before db_b_before < <(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["count"], d["bytes"])' 2>/dev/null || echo "0 0")
 
   sync_status=0
   timeout --signal=TERM --kill-after=60s "${remaining}s" \
@@ -158,8 +154,13 @@ for bucket in "${buckets[@]}"; do
   fi
 
   if (( diff <= SIZE_MISMATCH_TOLERANCE_BYTES )); then
-    echo "Bucket ${bucket}: S3=${s3_bytes}B Dropbox=${db_bytes}B - matches within ~100MB tolerance."
-    synced+=("$bucket")
+    if [[ "$db_bytes" == "$db_b_before" ]]; then
+      echo "Bucket ${bucket}: already in sync (${db_bytes}B) - nothing needed to be copied."
+      in_sync+=("$bucket")
+    else
+      echo "Bucket ${bucket}: S3=${s3_bytes}B Dropbox=${db_bytes}B - matches within ~100MB tolerance."
+      synced+=("$bucket")
+    fi
   else
     echo "Bucket ${bucket}: S3=${s3_bytes}B Dropbox=${db_bytes}B - still diverges by ${diff}B, will continue reconciling next run."
     unverified+=("$bucket")
