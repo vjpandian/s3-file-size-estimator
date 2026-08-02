@@ -28,6 +28,11 @@ RCLONE_RETRIES=10
 # failing, so pushing this too high trades throughput for retry churn.
 TRANSFERS="${RCLONE_TRANSFERS:-16}"
 CHECKERS="${RCLONE_CHECKERS:-32}"
+# rclone's default Dropbox encoding leaves : | < > " ? * untouched, and Dropbox
+# rejects those outright - such keys would fail every run forever and the
+# mirror would never converge. Encoding them to full-width equivalents makes
+# the upload succeed; the mapping is deterministic, so repeat runs still match.
+DROPBOX_ENCODING="Slash,BackSlash,Del,RightSpace,InvalidUtf8,Dot,Colon,Question,Asterisk,Pipe,LtGt,DoubleQuote"
 
 START_TIME=$(date +%s)
 JOB_BUDGET_SECONDS=$((3 * 3600 + 45 * 60))  # 3h45m soft budget, inside CircleCI's 4h job cap
@@ -97,7 +102,7 @@ for bucket in "${buckets[@]}"; do
   # everything is present in Dropbox and there is nothing to transfer.
   read -r s3_n s3_b < <(rclone size "s3:${bucket}" --s3-region "$region" --json 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["count"], d["bytes"])' 2>/dev/null || echo "")
-  read -r db_n db_b < <(rclone size "$dest" --json 2>/dev/null \
+  read -r db_n db_b < <(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["count"], d["bytes"])' 2>/dev/null || echo "")
 
   if [[ -n "$s3_n" && -n "$db_n" && "$s3_n" == "$db_n" && "$s3_b" == "$db_b" ]]; then
@@ -115,6 +120,7 @@ for bucket in "${buckets[@]}"; do
       --checkers "$CHECKERS" \
       --stats 30s \
       --max-delete "$MAX_DELETE_PER_BUCKET" \
+      --dropbox-encoding "$DROPBOX_ENCODING" \
       --retries "$RCLONE_RETRIES" \
       --low-level-retries 20 \
       --retries-sleep 10s \
@@ -138,7 +144,7 @@ for bucket in "${buckets[@]}"; do
   echo "Bucket ${bucket}: sync step complete."
 
   s3_bytes=$(rclone size "s3:${bucket}" --s3-region "$region" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || s3_bytes=""
-  db_bytes=$(rclone size "$dest" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || db_bytes=""
+  db_bytes=$(rclone size "$dest" --dropbox-encoding "$DROPBOX_ENCODING" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || db_bytes=""
 
   if [[ -z "$s3_bytes" || -z "$db_bytes" ]]; then
     echo "Bucket ${bucket}: could not verify size reconciliation this run; will re-check next run."
